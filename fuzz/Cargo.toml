@@ -1,0 +1,68 @@
+[package]
+name = "wireguard-sans-io-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.wireguard-sans-io]
+path = ".."
+
+# The fuzz crate is its own workspace root (excluded from the parent).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+# Keep overflow checks and debug assertions on while fuzzing: arithmetic
+# bugs should crash loudly even where release builds would wrap.
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "responder"
+path = "fuzz_targets/responder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "initiator"
+path = "fuzz_targets/initiator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport"
+path = "fuzz_targets/transport.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_ops"
+path = "fuzz_targets/session_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_roundtrip"
+path = "fuzz_targets/crypto_roundtrip.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,28 @@
+# Build artifacts
+/target/
+/fuzz/target/
+
+# Fuzzing run state (corpora and crash artifacts are machine-local;
+# minimized reproducers should be checked in deliberately as tests)
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Coverage instrumentation output
+*.profraw
+*.profdata
+
+# Profiler output
+perf.data
+perf.data.old
+flamegraph.svg
+
+# Local Claude Code permission grants (machine-specific)
+.claude/settings.local.json
+
+# Local reference copy of the whitepaper (third-party document, not code)
+/wireguard.pdf
+
+# Editor litter
+*.swp
+.DS_Store

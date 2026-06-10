@@ -1,0 +1,73 @@
+[package]
+name = "wireguard-sans-io"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "A sans-I/O, no_std, zero-allocation, zero-dependency, panic-free WireGuard protocol implementation"
+keywords = ["wireguard", "noise", "sans-io", "no-std", "vpn"]
+categories = ["network-programming", "cryptography", "no-std", "no-std::no-alloc"]
+repository = "https://example.invalid/wireguard-sans-io"
+readme = "README.md"
+
+# The fuzz harness is intentionally excluded: it needs nightly + libfuzzer and
+# must not affect builds/tests of the library itself.
+[workspace]
+exclude = ["fuzz"]
+
+[dependencies]
+# none, ever. The entire implementation (including all cryptography) is
+# in-tree, `#![forbid(unsafe_code)]`, no_std and allocation-free.
+
+[dev-dependencies]
+# none. Tests are self-contained and fully deterministic.
+
+# Light optimization for dev/test: keeps overflow checks and debug
+# assertions (both load-bearing for the test suite) while making the
+# in-tree crypto fast enough for the property-test and protocol-fuzz suites.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# `cargo build --profile profiling` produces optimized code with full debug
+# info for `perf record` / flamegraphs.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+# ---- panic-freedom wall -------------------------------------------------
+# The library must never panic. Any potential panic site must be rewritten
+# in terms of total operations (checked/wrapping arithmetic, fallible
+# slicing) or carry a narrowly-scoped `#[allow]` with a PANIC-FREEDOM proof
+# comment.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+modulo_one = "deny"
+exit = "deny"
+# ---- general hygiene ----------------------------------------------------
+mem_forget = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+must_use_candidate = "warn"
+missing_errors_doc = "warn"
