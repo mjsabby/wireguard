@@ -79,9 +79,10 @@ pub enum Encapsulated<'a> {
 #[derive(Debug)]
 pub enum Received<'a> {
     /// Decrypted transport payload. WireGuard pads plaintext to 16 bytes,
-    /// so this may carry up to 15 trailing zeros beyond the original IP
-    /// packet; [`crate::message::ip_packet_len`] recovers the inner
-    /// length.
+    /// so this may carry up to 15 trailing padding bytes (zero from a
+    /// conformant peer; the padding is authenticated but its content is
+    /// not verified here). [`crate::message::ip_packet_len`] recovers
+    /// the inner length.
     Data(&'a [u8]),
     /// An (authenticated) keepalive arrived. Nothing to deliver.
     Keepalive,
@@ -129,6 +130,17 @@ pub enum SendReason {
 }
 
 /// Observability counters. All values are cumulative since construction.
+///
+/// # ⚠️ Sensitivity
+///
+/// The per-failure counters (`mac1_failures`, `auth_failures`,
+/// `replays_dropped`, `cookies_sent`) are **attacker-influenceable** and,
+/// if exposed unaggregated to an untrusted observer (e.g. an
+/// unauthenticated metrics endpoint), act as exact oracles: an attacker
+/// can confirm this endpoint's static public key by watching
+/// `mac1_failures`, probe load state via `cookies_sent`, and inflate
+/// `replays_dropped` for free. Treat them as you would a debug log:
+/// aggregate before publishing, or restrict who can read them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
@@ -240,7 +252,10 @@ pub struct Tunnel {
     mac_keys: MacKeys,
 
     inflight: Option<InFlightInitiation>,
-    last_sent_mac1: Option<[u8; 16]>,
+    /// `mac1` of the last initiation we sent (cookie-reply AAD).
+    last_init_mac1: Option<[u8; 16]>,
+    /// `mac1` of the last response we sent (cookie-reply AAD).
+    last_resp_mac1: Option<[u8; 16]>,
     cookie: Option<LastCookie>,
     cookie_jar: CookieJar,
     greatest_timestamp: Option<Tai64N>,
@@ -308,7 +323,8 @@ impl Tunnel {
             constants: HandshakeConstants::new(),
             mac_keys,
             inflight: None,
-            last_sent_mac1: None,
+            last_init_mac1: None,
+            last_resp_mac1: None,
             cookie: None,
             cookie_jar: CookieJar::new(),
             greatest_timestamp: None,
@@ -421,9 +437,19 @@ impl Tunnel {
     /// `true`, handshake messages without a valid `mac2` get a cookie
     /// reply instead of processing (whitepaper §5.3).
     ///
+    /// # Caller obligations (DoS posture)
+    ///
+    /// WireGuard's design lets anyone who knows this endpoint's *public*
+    /// key force at least one X25519 operation per handshake message when
+    /// `under_load == false`. The library has no internal rate limiter
+    /// (sans-I/O); **the caller must** assert `under_load` and/or apply an
+    /// external per-source rate limit when handshake volume is high,
+    /// exactly as the kernel implementation does with `ratelimiter.c`.
+    ///
     /// # Errors
     /// All attacker-triggerable errors mean "drop the datagram silently";
-    /// no state was changed and nothing must be sent. See [`Error`].
+    /// no protocol state was changed and nothing must be sent. See
+    /// [`Error`].
     pub fn decapsulate<'a>(
         &mut self,
         now: Now,
@@ -456,12 +482,18 @@ impl Tunnel {
                     return Ok(Received::Reply(wire));
                 }
                 // Expensive part begins only after the cheap MACs passed.
-                let consumed = noise::consume_initiation(
+                let consumed = match noise::consume_initiation(
                     &self.constants,
                     &self.local_static,
                     &self.local_public,
                     &m,
-                )?;
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.stats.auth_failures = self.stats.auth_failures.saturating_add(1);
+                        return Err(e);
+                    }
+                };
                 if !ct::ct_eq(&consumed.static_public, self.peer_public.as_bytes()) {
                     self.stats.auth_failures = self.stats.auth_failures.saturating_add(1);
                     return Err(Error::UnknownPeer);
@@ -481,7 +513,7 @@ impl Tunnel {
                 let mac1 =
                     cookie::apply_macs(&self.mac_keys, self.cookie.as_ref(), now.ticks, msg)?;
                 // Commit only now that nothing can fail.
-                self.last_sent_mac1 = Some(mac1);
+                self.last_resp_mac1 = Some(mac1);
                 self.greatest_timestamp = Some(consumed.timestamp);
                 self.next = Some(Session::new(keys, now.ticks));
                 self.stats.handshakes_responded = self.stats.handshakes_responded.saturating_add(1);
@@ -489,15 +521,18 @@ impl Tunnel {
                 Ok(Received::Reply(wire))
             }
             Ok(Packet::HandshakeResponse(m)) => {
+                // Cheap mac1 first (consistent with the initiation path),
+                // then the index match — avoids a sub-µs timing probe of
+                // the in-flight index.
+                if !cookie::verify_mac1(&self.mac_keys, m.alpha, m.mac1) {
+                    self.stats.mac1_failures = self.stats.mac1_failures.saturating_add(1);
+                    return Err(Error::InvalidMac1);
+                }
                 let inflight = self
                     .inflight
                     .as_ref()
                     .filter(|i| i.local_index == m.receiver_index)
                     .ok_or(Error::NoPendingHandshake)?;
-                if !cookie::verify_mac1(&self.mac_keys, m.alpha, m.mac1) {
-                    self.stats.mac1_failures = self.stats.mac1_failures.saturating_add(1);
-                    return Err(Error::InvalidMac1);
-                }
                 if under_load && !self.cookie_jar.verify_mac2(remote, m.beta, m.mac2) {
                     let n = cookie::build_cookie_reply(
                         &self.mac_keys,
@@ -541,11 +576,26 @@ impl Tunnel {
                 if !known {
                     return Err(Error::UnknownReceiverIndex);
                 }
-                let mac1 = self.last_sent_mac1.ok_or(Error::NoPendingHandshake)?;
-                let cookie = cookie::consume_cookie_reply(&self.mac_keys, &mac1, &m, now.ticks)
-                    .inspect_err(|_| {
+                // The reply is sealed with AAD = mac1 of the message that
+                // provoked it; that may have been our last initiation OR
+                // our last response, so try both.
+                let try_open = |mac1: &Option<[u8; 16]>| {
+                    mac1.as_ref().and_then(|m1| {
+                        cookie::consume_cookie_reply(&self.mac_keys, m1, &m, now.ticks).ok()
+                    })
+                };
+                let cookie = match try_open(&self.last_init_mac1)
+                    .or_else(|| try_open(&self.last_resp_mac1))
+                {
+                    Some(c) => c,
+                    None if self.last_init_mac1.is_none() && self.last_resp_mac1.is_none() => {
+                        return Err(Error::NoPendingHandshake);
+                    }
+                    None => {
                         self.stats.auth_failures = self.stats.auth_failures.saturating_add(1);
-                    })?;
+                        return Err(Error::InvalidCookie);
+                    }
+                };
                 self.cookie = Some(cookie);
                 self.stats.cookies_received = self.stats.cookies_received.saturating_add(1);
                 Ok(Received::CookieStored)
@@ -571,6 +621,17 @@ impl Tunnel {
     ) -> Result<PollOutput<'a>, Error> {
         let now = self.clamp_now(now);
         let t = now.ticks;
+
+        // An unconfirmed responder session in `next` cannot indefinitely
+        // postpone wiping of `previous`/`current`: age it out on the
+        // same Reject-After-Time horizon as any other keypair.
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|s| s.age(t) >= REJECT_AFTER_TIME)
+        {
+            self.next = None;
+        }
 
         // §6.3: discard everything after 3 × Reject-After-Time without a
         // new session.
@@ -653,10 +714,16 @@ impl Tunnel {
                     return Ok(PollOutput::Send(wire, SendReason::PersistentKeepalive));
                 }
             } else if self.inflight.is_none()
-                && !self.timers.gave_up
                 && self.timers.initiation_allowed(t)
+                && self.timers.persistent_revive_allowed(t, interval_ns)
             {
                 // Keep the tunnel alive even with nothing to send.
+                // Persistent-keepalive deliberately survives `gave_up`
+                // (its whole purpose is unconditional liveness across
+                // peer reboots / NAT expiry), but after a failed attempt
+                // it backs off by one keepalive interval rather than
+                // hammering every Rekey-Timeout.
+                self.timers.gave_up = false;
                 self.timers.attempt_started = None;
                 let n = self.send_initiation(now, out, rng, true)?;
                 let wire = out.get(..n).ok_or(Error::Internal)?;
@@ -704,8 +771,17 @@ impl Tunnel {
             if let Some(s) = &self.current {
                 let base = self.timers.last_any_tx.unwrap_or(s.created);
                 Some(base.add_nanos(interval_ns))
-            } else if self.inflight.is_none() && !self.timers.gave_up {
-                Some(pacing_at)
+            } else if self.inflight.is_none() {
+                // No session: wake at the pacing deadline, or — if the
+                // last attempt gave up — one keepalive interval after
+                // the last initiation.
+                Some(if self.timers.gave_up {
+                    self.timers
+                        .last_initiation_tx
+                        .map_or(Ticks::ZERO, |last| last.add_nanos(interval_ns))
+                } else {
+                    pacing_at
+                })
             } else {
                 None
             }
@@ -857,6 +933,20 @@ impl Tunnel {
     ) -> Result<usize, Error> {
         let local_index = self.fresh_index(rng)?;
         let eph = rng.gen32().map_err(|_| Error::EntropyFailure)?;
+        // §6.1 jitter (≤ 333 ms, timer-driven only). Drawn — and on
+        // failure degraded to 0 — *before* any state is committed, so an
+        // entropy hiccup here can never strand a phantom `inflight`.
+        let jitter = if timer_driven {
+            let mut j = [0u8; 8];
+            match rng.fill(&mut j) {
+                Ok(()) => u64::from_le_bytes(j)
+                    .checked_rem(REKEY_TIMEOUT_JITTER_MAX.saturating_add(1))
+                    .unwrap_or(0),
+                Err(_) => 0, // jitter is non-security-critical: degrade, don't stall
+            }
+        } else {
+            0
+        };
         let inflight = noise::create_initiation(
             &self.constants,
             &self.local_static,
@@ -871,18 +961,9 @@ impl Tunnel {
             .get_mut(..HANDSHAKE_INITIATION_LEN)
             .ok_or(Error::Internal)?;
         let mac1 = cookie::apply_macs(&self.mac_keys, self.cookie.as_ref(), now.ticks, msg)?;
-        self.last_sent_mac1 = Some(mac1);
+        // Commit: nothing below can fail.
+        self.last_init_mac1 = Some(mac1);
         self.inflight = Some(inflight);
-        // §6.1: jitter only on timer-driven sends, ≤ 333 ms.
-        let jitter = if timer_driven {
-            let mut j = [0u8; 8];
-            rng.fill(&mut j).map_err(|_| Error::EntropyFailure)?;
-            u64::from_le_bytes(j)
-                .checked_rem(REKEY_TIMEOUT_JITTER_MAX.saturating_add(1))
-                .unwrap_or(0)
-        } else {
-            0
-        };
         self.timers.note_initiation_tx(now.ticks, jitter);
         self.stats.handshakes_initiated = self.stats.handshakes_initiated.saturating_add(1);
         Ok(HANDSHAKE_INITIATION_LEN)
@@ -906,6 +987,14 @@ impl Tunnel {
         self.timers.note_keepalive_tx(now.ticks);
         self.stats.tx_keepalives = self.stats.tx_keepalives.saturating_add(1);
         self.stats.tx_transport = self.stats.tx_transport.saturating_add(1);
+        // §6.2 send-path rekey applies to keepalives too: a keepalive-only
+        // initiator session must not coast past Rekey-After-Time.
+        let session = self.current.as_ref().ok_or(Error::Internal)?;
+        if session.send_counter >= REKEY_AFTER_MESSAGES
+            || (session.keys.is_initiator && session.age(now.ticks) >= REKEY_AFTER_TIME)
+        {
+            self.timers.rekey_due = true;
+        }
         out.get(..TRANSPORT_OVERHEAD).ok_or(Error::Internal)
     }
 

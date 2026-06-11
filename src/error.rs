@@ -8,9 +8,19 @@ use core::fmt;
 ///
 /// * **Attacker-triggerable** (`InvalidPacket`, `InvalidMac1`, `AuthFailure`,
 ///   `Replay`, …): returned while processing an incoming datagram. The packet
-///   has been rejected and **no state was modified and nothing must be sent
-///   in response** — WireGuard stays silent toward unauthenticated peers.
-///   Callers should drop the datagram and may count the event.
+///   has been rejected and **no protocol state was modified and nothing must
+///   be sent in response** — WireGuard stays silent toward unauthenticated
+///   peers. ([`crate::Stats`] failure counters are still incremented; see
+///   that type's note on exposure.) Callers should drop the datagram.
+///
+///   Do **not** surface the specific attacker-triggerable variant to
+///   untrusted observers (logs, per-variant metrics): which variant fires
+///   is itself an oracle (e.g. `InvalidMac1` vs `AuthFailure` confirms
+///   knowledge of this endpoint's static public key). The "silent toward
+///   unauthenticated peers" guarantee covers what is *sent*, not the time
+///   taken — which inherently differs between variants — so timing-based
+///   identity probing is a known property of the protocol, not of this
+///   implementation.
 /// * **Caller errors** (`BufferTooSmall`, `NotEstablished`, …): local
 ///   conditions the caller can act upon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

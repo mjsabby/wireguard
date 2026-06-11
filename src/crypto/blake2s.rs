@@ -208,7 +208,7 @@ impl Default for Blake2s256 {
 impl core::fmt::Debug for Blake2s256 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Never print absorbed (possibly secret) state.
-        f.write_str("Blake2s256 {{ .. }}")
+        f.write_str("Blake2s256 { .. }")
     }
 }
 
@@ -262,7 +262,7 @@ impl Blake2sMac {
 
 impl core::fmt::Debug for Blake2sMac {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Blake2sMac {{ .. }}")
+        f.write_str("Blake2sMac { .. }")
     }
 }
 

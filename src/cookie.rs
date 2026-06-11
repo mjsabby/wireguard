@@ -87,8 +87,17 @@ impl core::fmt::Debug for LastCookie {
 pub(crate) struct CookieJar {
     secret: [u8; 32],
     previous: [u8; 32],
+    /// `previous` holds a real (random) secret. False until the *second*
+    /// rotation, so the all-zero pre-prime value is never accepted.
+    has_previous: bool,
     rotated_at: Ticks,
     primed: bool,
+    /// 192-bit counter for XChaCha20 cookie-reply nonces. The XChaCha
+    /// nonce needs only uniqueness under `cookie_send`, not
+    /// unpredictability, so a counter avoids drawing 24 bytes of entropy
+    /// per reply (which under flood becomes the dominant cost and can
+    /// stall a constrained HWRNG).
+    nonce_counter: [u64; 3],
 }
 
 impl CookieJar {
@@ -96,19 +105,55 @@ impl CookieJar {
         Self {
             secret: [0u8; 32],
             previous: [0u8; 32],
+            has_previous: false,
             rotated_at: Ticks::ZERO,
             primed: false,
+            nonce_counter: [0u64; 3],
         }
     }
 
     fn rotate_if_needed(&mut self, now: Ticks, rng: &mut dyn EntropySource) -> Result<(), Error> {
         if !self.primed || now.since(self.rotated_at) >= COOKIE_LIFETIME {
+            let fresh = rng.gen32().map_err(|_| Error::EntropyFailure)?;
+            // Only after entropy succeeded: commit the rotation.
             self.previous = self.secret;
-            self.secret = rng.gen32().map_err(|_| Error::EntropyFailure)?;
+            self.has_previous = self.primed; // true from the second rotation on
+            self.secret = fresh;
             self.rotated_at = now;
+            if !self.primed {
+                // First prime: also seed the nonce counter from entropy
+                // so independent restarts don't replay nonces. Failure
+                // here is harmless (counter starts at 0; the
+                // `cookie_send` key is itself per-static-key, and
+                // collisions across restarts only weaken the
+                // authenticity of *attacker-discardable* cookie replies).
+                let mut seed = [0u8; 24];
+                if rng.fill(&mut seed).is_ok() {
+                    let (a, rest) = seed.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
+                    let (b, rest) = rest.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
+                    let (c, _) = rest.split_first_chunk::<8>().unwrap_or((&[0; 8], &[]));
+                    self.nonce_counter =
+                        [u64::from_le_bytes(*a), u64::from_le_bytes(*b), u64::from_le_bytes(*c)];
+                }
+            }
             self.primed = true;
         }
         Ok(())
+    }
+
+    /// Take the next unique 24-byte XChaCha20 nonce.
+    fn next_nonce(&mut self) -> [u8; 24] {
+        // 192-bit increment: practically inexhaustible.
+        let [a, b, c] = self.nonce_counter;
+        let (a, carry) = a.overflowing_add(1);
+        let (b, carry) = b.overflowing_add(u64::from(carry));
+        let c = c.wrapping_add(u64::from(carry));
+        self.nonce_counter = [a, b, c];
+        let mut out = [0u8; 24];
+        for (chunk, word) in out.chunks_exact_mut(8).zip(self.nonce_counter.iter()) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        out
     }
 
     /// `τ := Mac(R_m, A_remote)`: the cookie for a remote endpoint.
@@ -124,16 +169,18 @@ impl CookieJar {
     }
 
     /// Does `mac2` prove possession of a cookie we minted recently for
-    /// `remote`? Checks the current and previous secret, constant time.
+    /// `remote`? Checks the current and (if real) previous secret, in
+    /// constant time.
     pub(crate) fn verify_mac2(&self, remote: &[u8], beta: &[u8], mac2: &[u8; 16]) -> bool {
         if !self.primed {
             return false;
         }
         let current = blake2s::mac(&blake2s::mac(&self.secret, &[remote]), &[beta]);
         let previous = blake2s::mac(&blake2s::mac(&self.previous, &[remote]), &[beta]);
-        // Bitwise-OR the two comparisons so both run regardless.
+        // Both arms always evaluated; `has_previous` masks the
+        // pre-second-rotation all-zero secret so it is never accepted.
         let ok_current = ct::ct_eq(&current, mac2);
-        let ok_previous = ct::ct_eq(&previous, mac2);
+        let ok_previous = ct::ct_eq(&previous, mac2) & self.has_previous;
         ok_current | ok_previous
     }
 }
@@ -200,8 +247,7 @@ pub(crate) fn build_cookie_reply(
         return Err(Error::BufferTooSmall);
     }
     let mut cookie = jar.mint(now, rng, remote)?;
-    let mut nonce = [0u8; 24];
-    rng.fill(&mut nonce).map_err(|_| Error::EntropyFailure)?;
+    let nonce = jar.next_nonce();
     let mut encrypted = [0u8; 32];
     let sealed = aead::xseal(
         &keys.cookie_send,
@@ -432,5 +478,49 @@ mod tests {
         let mut jar = CookieJar::new();
         let _ = jar.mint(Ticks::ZERO, &mut rng, b"r").unwrap();
         assert!(!jar.verify_mac2(b"r", b"beta", &[0u8; 16]));
+    }
+
+    /// Regression: after the first rotation `previous` is the all-zero
+    /// pre-prime value, which an attacker can key against without any
+    /// secret knowledge. `has_previous` must mask it.
+    #[test]
+    fn jar_rejects_mac2_keyed_on_all_zero_previous() {
+        let mut rng = DeterministicRng::new(0xa7);
+        let mut jar = CookieJar::new();
+        let _ = jar.mint(Ticks::ZERO, &mut rng, b"x").unwrap();
+        let remote = b"203.0.113.5:51820";
+        let beta = b"some 116- or 76-byte msg-beta prefix the attacker built";
+        let forged_cookie = blake2s::mac(&[0u8; 32], &[remote.as_slice()]);
+        let forged_mac2 = blake2s::mac(&forged_cookie, &[beta.as_slice()]);
+        assert!(
+            !jar.verify_mac2(remote, beta, &forged_mac2),
+            "all-zero `previous` must never be accepted as a mac2 key"
+        );
+        // After a real second rotation, the (now random) previous works.
+        let c = jar.mint(Ticks::ZERO, &mut rng, remote).unwrap();
+        let real_mac2 = blake2s::mac(&c, &[beta.as_slice()]);
+        let _ = jar
+            .mint(Ticks::ZERO.add_nanos(COOKIE_LIFETIME), &mut rng, remote)
+            .unwrap();
+        assert!(jar.verify_mac2(remote, beta, &real_mac2), "real previous");
+    }
+
+    #[test]
+    fn cookie_reply_nonces_are_unique_and_entropy_free() {
+        // Two replies under load draw no per-reply entropy and never
+        // repeat a nonce.
+        let mut rng = DeterministicRng::new(5);
+        let mut jar = CookieJar::new();
+        let _ = jar.mint(Ticks::ZERO, &mut rng, b"r").unwrap(); // primes
+        let n1 = jar.next_nonce();
+        let n2 = jar.next_nonce();
+        assert_ne!(n1, n2);
+        // 192-bit carry across word boundaries.
+        let mut jar2 = CookieJar::new();
+        jar2.nonce_counter = [u64::MAX, u64::MAX, 0];
+        jar2.primed = true;
+        let n = jar2.next_nonce();
+        assert_eq!(jar2.nonce_counter, [0, 0, 1]);
+        assert_eq!(&n[16..], 1u64.to_le_bytes());
     }
 }
