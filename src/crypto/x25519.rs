@@ -36,8 +36,15 @@ fn m(x: u64, y: u64) -> u128 {
 }
 
 /// A field element.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 struct Fe([u64; 5]);
+
+impl core::fmt::Debug for Fe {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Limbs may carry secret-derived state during the ladder.
+        f.write_str("Fe(REDACTED)")
+    }
+}
 
 impl Fe {
     const ZERO: Self = Self([0; 5]);
@@ -151,8 +158,9 @@ impl Fe {
     }
 
     /// Schoolbook multiplication mod p with the 19-fold on high cross
-    /// terms. Inputs may have limbs up to `2^54`; output is weakly
-    /// reduced. Accumulators stay below 2^115 « 2^128.
+    /// terms. Inputs may have limbs up to `2^53` (the largest the ladder
+    /// ever produces is < 2^52.6 via `add`/`sub`); output is weakly
+    /// reduced. Accumulators stay below 2^113 « 2^128.
     fn mul(self, rhs: Self) -> Self {
         let [a0, a1, a2, a3, a4] = self.0;
         let [b0, b1, b2, b3, b4] = rhs.0;

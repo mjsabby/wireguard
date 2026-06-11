@@ -14,6 +14,36 @@ use crate::keys::{PresharedKey, PublicKey, StaticSecret};
 use crate::message::{self, HandshakeInitiation, HandshakeResponse};
 use crate::time::Tai64N;
 
+/// A stack-held 32-byte secret that wipes itself on drop, so every early
+/// `?`-return below honours the module's wipe contract without explicit
+/// cleanup at each error site.
+struct Secret([u8; 32]);
+
+impl Secret {
+    fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    fn set(&mut self, bytes: [u8; 32]) {
+        self.0 = bytes;
+    }
+    fn take(mut self) -> [u8; 32] {
+        core::mem::take(&mut self.0)
+    }
+}
+
+impl core::ops::Deref for Secret {
+    type Target = [u8; 32];
+    fn deref(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        ct::wipe_array(&mut self.0);
+    }
+}
+
 /// `Hash(Construction)` and `Hash(C0 ∥ Identifier)`: the same for every
 /// handshake, computed once per [`crate::Tunnel`].
 #[derive(Clone)]
@@ -112,20 +142,21 @@ pub(crate) fn create_initiation(
         return Err(Error::BufferTooSmall);
     }
 
-    let mut ck = constants.ck0;
+    let mut ck = Secret::new(constants.ck0);
     let mut h = constants.h0;
     mix_hash(&mut h, peer_public.as_bytes());
 
-    let eph_secret = x25519::clamp_scalar(eph_secret_raw);
+    let eph_secret = Secret::new(x25519::clamp_scalar(eph_secret_raw));
     let eph_public = x25519::x25519_base(&eph_secret);
-    ck = kdf::kdf1(&ck, &eph_public);
+    ck.set(kdf::kdf1(&ck, &eph_public));
     mix_hash(&mut h, &eph_public);
 
     // es
-    let mut es = x25519::shared_secret(&eph_secret, peer_public.as_bytes())?;
-    let (ck_next, mut k) = kdf::kdf2(&ck, &es);
-    ck = ck_next;
-    ct::wipe_array(&mut es);
+    let es = Secret::new(x25519::shared_secret(&eph_secret, peer_public.as_bytes())?);
+    let (ck_next, k) = kdf::kdf2(&ck, &*es);
+    ck.set(ck_next);
+    drop(es);
+    let k = Secret::new(k);
     let mut encrypted_static = [0u8; 48];
     aead::seal(
         &k,
@@ -134,14 +165,18 @@ pub(crate) fn create_initiation(
         local_public.as_bytes(),
         &mut encrypted_static,
     )?;
-    ct::wipe_array(&mut k);
+    drop(k);
     mix_hash(&mut h, &encrypted_static);
 
     // ss
-    let mut ss = x25519::shared_secret(local_static.as_bytes(), peer_public.as_bytes())?;
-    let (ck_next, mut k) = kdf::kdf2(&ck, &ss);
-    ck = ck_next;
-    ct::wipe_array(&mut ss);
+    let ss = Secret::new(x25519::shared_secret(
+        local_static.as_bytes(),
+        peer_public.as_bytes(),
+    )?);
+    let (ck_next, k) = kdf::kdf2(&ck, &*ss);
+    ck.set(ck_next);
+    drop(ss);
+    let k = Secret::new(k);
     let mut encrypted_timestamp = [0u8; 28];
     aead::seal(
         &k,
@@ -150,7 +185,7 @@ pub(crate) fn create_initiation(
         timestamp.as_bytes(),
         &mut encrypted_timestamp,
     )?;
-    ct::wipe_array(&mut k);
+    drop(k);
     mix_hash(&mut h, &encrypted_timestamp);
 
     message::build_initiation(
@@ -163,8 +198,8 @@ pub(crate) fn create_initiation(
 
     Ok(InFlightInitiation {
         local_index,
-        eph_secret,
-        chain: ck,
+        eph_secret: eph_secret.take(),
+        chain: ck.take(),
         hash: h,
     })
 }
@@ -211,18 +246,19 @@ pub(crate) fn consume_initiation(
     local_public: &PublicKey,
     msg: &HandshakeInitiation<'_>,
 ) -> Result<ConsumedInitiation, Error> {
-    let mut ck = constants.ck0;
+    let mut ck = Secret::new(constants.ck0);
     let mut h = constants.h0;
     mix_hash(&mut h, local_public.as_bytes());
 
-    ck = kdf::kdf1(&ck, msg.ephemeral);
+    ck.set(kdf::kdf1(&ck, msg.ephemeral));
     mix_hash(&mut h, msg.ephemeral);
 
     // es (from the responder's side: DH(S_priv_r, E_pub_i)).
-    let mut es = x25519::shared_secret(local_static.as_bytes(), msg.ephemeral)?;
-    let (ck_next, mut k) = kdf::kdf2(&ck, &es);
-    ck = ck_next;
-    ct::wipe_array(&mut es);
+    let es = Secret::new(x25519::shared_secret(local_static.as_bytes(), msg.ephemeral)?);
+    let (ck_next, k) = kdf::kdf2(&ck, &*es);
+    ck.set(ck_next);
+    drop(es);
+    let k = Secret::new(k);
     let mut static_public = [0u8; 32];
     let opened = aead::open(
         &k,
@@ -231,17 +267,18 @@ pub(crate) fn consume_initiation(
         msg.encrypted_static,
         &mut static_public,
     );
-    ct::wipe_array(&mut k);
+    drop(k);
     if opened != Ok(32) {
         return Err(Error::AuthFailure);
     }
     mix_hash(&mut h, msg.encrypted_static);
 
     // ss
-    let mut ss = x25519::shared_secret(local_static.as_bytes(), &static_public)?;
-    let (ck_next, mut k) = kdf::kdf2(&ck, &ss);
-    ck = ck_next;
-    ct::wipe_array(&mut ss);
+    let ss = Secret::new(x25519::shared_secret(local_static.as_bytes(), &static_public)?);
+    let (ck_next, k) = kdf::kdf2(&ck, &*ss);
+    ck.set(ck_next);
+    drop(ss);
+    let k = Secret::new(k);
     let mut timestamp = [0u8; 12];
     let opened = aead::open(
         &k,
@@ -250,7 +287,7 @@ pub(crate) fn consume_initiation(
         msg.encrypted_timestamp,
         &mut timestamp,
     );
-    ct::wipe_array(&mut k);
+    drop(k);
     if opened != Ok(12) {
         return Err(Error::AuthFailure);
     }
@@ -261,7 +298,7 @@ pub(crate) fn consume_initiation(
         static_public,
         timestamp: Tai64N::from_bytes(timestamp),
         eph_public: *msg.ephemeral,
-        chain: ck,
+        chain: ck.take(),
         hash: h,
     })
 }
@@ -282,28 +319,31 @@ pub(crate) fn create_response(
         return Err(Error::BufferTooSmall);
     }
 
-    let mut ck = consumed.chain;
+    let mut ck = Secret::new(consumed.chain);
     let mut h = consumed.hash;
 
-    let eph_secret = x25519::clamp_scalar(eph_secret_raw);
+    let eph_secret = Secret::new(x25519::clamp_scalar(eph_secret_raw));
     let eph_public = x25519::x25519_base(&eph_secret);
-    ck = kdf::kdf1(&ck, &eph_public);
+    ck.set(kdf::kdf1(&ck, &eph_public));
     mix_hash(&mut h, &eph_public);
 
     // ee
-    let mut ee = x25519::shared_secret(&eph_secret, &consumed.eph_public)?;
-    ck = kdf::kdf1(&ck, &ee);
-    ct::wipe_array(&mut ee);
+    let ee = Secret::new(x25519::shared_secret(&eph_secret, &consumed.eph_public)?);
+    ck.set(kdf::kdf1(&ck, &*ee));
+    drop(ee);
     // se (responder side: DH(E_priv_r, S_pub_i)).
-    let mut se = x25519::shared_secret(&eph_secret, &consumed.static_public)?;
-    ck = kdf::kdf1(&ck, &se);
-    ct::wipe_array(&mut se);
+    let se = Secret::new(x25519::shared_secret(&eph_secret, &consumed.static_public)?);
+    ck.set(kdf::kdf1(&ck, &*se));
+    drop(se);
+    drop(eph_secret);
 
     // psk2
-    let (ck_next, mut tau, mut k) = kdf::kdf3(&ck, psk.as_bytes());
-    ck = ck_next;
-    mix_hash(&mut h, &tau);
-    ct::wipe_array(&mut tau);
+    let (ck_next, tau, k) = kdf::kdf3(&ck, psk.as_bytes());
+    ck.set(ck_next);
+    let tau = Secret::new(tau);
+    let k = Secret::new(k);
+    mix_hash(&mut h, &*tau);
+    drop(tau);
 
     let mut encrypted_nothing = [0u8; 16];
     aead::seal(
@@ -313,7 +353,7 @@ pub(crate) fn create_response(
         &[],
         &mut encrypted_nothing,
     )?;
-    ct::wipe_array(&mut k);
+    drop(k);
     mix_hash(&mut h, &encrypted_nothing);
 
     message::build_response(
@@ -326,9 +366,7 @@ pub(crate) fn create_response(
 
     // (T_send_i = T_recv_r, T_recv_i = T_send_r) := Kdf2(C, ε)
     let (t_initiator, t_responder) = kdf::kdf2(&ck, &[]);
-    ct::wipe_array(&mut ck);
-    let mut eph_secret = eph_secret;
-    ct::wipe_array(&mut eph_secret);
+    drop(ck);
 
     Ok(SessionKeys {
         send: t_responder,
@@ -352,26 +390,31 @@ pub(crate) fn consume_response(
     psk: &PresharedKey,
     msg: &HandshakeResponse<'_>,
 ) -> Result<SessionKeys, Error> {
-    let mut ck = inflight.chain;
+    let mut ck = Secret::new(inflight.chain);
     let mut h = inflight.hash;
 
-    ck = kdf::kdf1(&ck, msg.ephemeral);
+    ck.set(kdf::kdf1(&ck, msg.ephemeral));
     mix_hash(&mut h, msg.ephemeral);
 
     // ee
-    let mut ee = x25519::shared_secret(&inflight.eph_secret, msg.ephemeral)?;
-    ck = kdf::kdf1(&ck, &ee);
-    ct::wipe_array(&mut ee);
+    let ee = Secret::new(x25519::shared_secret(&inflight.eph_secret, msg.ephemeral)?);
+    ck.set(kdf::kdf1(&ck, &*ee));
+    drop(ee);
     // se (initiator side: DH(S_priv_i, E_pub_r)).
-    let mut se = x25519::shared_secret(local_static.as_bytes(), msg.ephemeral)?;
-    ck = kdf::kdf1(&ck, &se);
-    ct::wipe_array(&mut se);
+    let se = Secret::new(x25519::shared_secret(
+        local_static.as_bytes(),
+        msg.ephemeral,
+    )?);
+    ck.set(kdf::kdf1(&ck, &*se));
+    drop(se);
 
     // psk2
-    let (ck_next, mut tau, mut k) = kdf::kdf3(&ck, psk.as_bytes());
-    ck = ck_next;
-    mix_hash(&mut h, &tau);
-    ct::wipe_array(&mut tau);
+    let (ck_next, tau, k) = kdf::kdf3(&ck, psk.as_bytes());
+    ck.set(ck_next);
+    let tau = Secret::new(tau);
+    let k = Secret::new(k);
+    mix_hash(&mut h, &*tau);
+    drop(tau);
 
     let mut nothing = [0u8; 0];
     let opened = aead::open(
@@ -381,14 +424,14 @@ pub(crate) fn consume_response(
         msg.encrypted_nothing,
         &mut nothing,
     );
-    ct::wipe_array(&mut k);
+    drop(k);
     if opened != Ok(0) {
         return Err(Error::AuthFailure);
     }
     mix_hash(&mut h, msg.encrypted_nothing);
 
     let (t_initiator, t_responder) = kdf::kdf2(&ck, &[]);
-    ct::wipe_array(&mut ck);
+    drop(ck);
 
     Ok(SessionKeys {
         send: t_initiator,

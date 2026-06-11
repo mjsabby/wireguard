@@ -66,7 +66,10 @@ pub struct Now {
     pub ticks: Ticks,
     /// Wall-clock seconds since the Unix epoch. Only used to build the
     /// TAI64N timestamp inside handshake initiations; it must be (roughly)
-    /// real so that initiations remain monotone across process restarts.
+    /// real **and non-decreasing**: the library clamps `ticks` against
+    /// regression but cannot clamp the wall clock, so a backwards step
+    /// here makes the peer reject our initiations as
+    /// [`crate::Error::ReplayedTimestamp`] until the clock catches up.
     pub unix_secs: u64,
     /// Sub-second nanoseconds of the wall clock, `< 1_000_000_000`
     /// (defensively clamped, never panics).
