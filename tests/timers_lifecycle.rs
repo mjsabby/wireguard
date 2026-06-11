@@ -152,11 +152,10 @@ fn new_initiation_does_not_extend_current_session_expiry() {
     // clock to 100s here, keeping the stale session alive until 280s.
     let now100 = p.clock.advance(S);
     let mut wire = [0u8; 2048];
-    let init = p
-        .a
-        .initiate_handshake(now100, &mut wire, &mut p.rng)
-        .unwrap()
-        .to_vec();
+    let init =
+        p.a.initiate_handshake(now100, &mut wire, &mut p.rng)
+            .unwrap()
+            .to_vec();
     let mut scratch = [0u8; 2048];
     match p
         .b
@@ -184,10 +183,9 @@ fn new_initiation_does_not_extend_current_session_expiry() {
     // rejected as Expired. If the 100s initiation had extended v1's clock, this
     // would wrongly succeed.
     let now181 = p.clock.advance(2 * S);
-    let err = p
-        .b
-        .decapsulate(now181, b"a-addr", false, &v1_late, &mut out, &mut p.rng)
-        .unwrap_err();
+    let err =
+        p.b.decapsulate(now181, b"a-addr", false, &v1_late, &mut out, &mut p.rng)
+            .unwrap_err();
     assert!(
         matches!(err, Error::Expired),
         "stale current session must expire on its own birthdate+180s, got {err:?}"

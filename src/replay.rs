@@ -17,6 +17,9 @@ pub const WINDOW_BITS: u64 = 2048;
 /// erase bits of counters still inside the window (RFC 6479's
 /// "bitmap minus one word" rule, same layout as wireguard-go).
 const WORDS: usize = (WINDOW_BITS / 64) as usize + 1;
+/// `WORDS` as `u64`, so word-index modulo is computed before any
+/// `usize` cast (correct on 32-bit targets even at counter ≥ 2³⁸).
+const WORDS_U64: u64 = WORDS as u64;
 
 /// Sliding bitmap of received counters.
 #[derive(Clone, Debug)]
@@ -85,12 +88,15 @@ impl ReplayWindow {
                 self.bitmap = [0u64; WORDS];
             } else {
                 // Words are used modulo WORDS; clear the words between the
-                // old and new top, exclusive-old / inclusive-new.
+                // old and new top, exclusive-old / inclusive-new. The
+                // modulo is taken in u64 BEFORE the usize cast so 32-bit
+                // targets index correctly even at counter ≥ 2^38 (audit
+                // L-1; unreachable in practice but cheap to do right).
                 let old_word = self.greatest >> 6;
                 let new_word = counter >> 6;
                 let mut w = old_word.wrapping_add(1);
                 while w <= new_word {
-                    if let Some(slot) = self.bitmap.get_mut((w as usize) % WORDS) {
+                    if let Some(slot) = self.bitmap.get_mut((w % WORDS_U64) as usize) {
                         *slot = 0;
                     }
                     w = w.wrapping_add(1);
@@ -109,13 +115,13 @@ impl ReplayWindow {
     }
 
     fn bit(&self, counter: u64) -> bool {
-        let word = ((counter >> 6) as usize) % WORDS;
+        let word = ((counter >> 6) % WORDS_U64) as usize;
         let mask = 1u64 << (counter & 63);
         self.bitmap.get(word).is_some_and(|w| w & mask != 0)
     }
 
     fn set_bit(&mut self, counter: u64) {
-        let word = ((counter >> 6) as usize) % WORDS;
+        let word = ((counter >> 6) % WORDS_U64) as usize;
         let mask = 1u64 << (counter & 63);
         if let Some(w) = self.bitmap.get_mut(word) {
             *w |= mask;

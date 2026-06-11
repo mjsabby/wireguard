@@ -160,13 +160,21 @@ impl Core {
         for (chunk, word) in out.chunks_exact_mut(4).zip(self.h.iter()) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
+        // State is wiped by `Drop` below.
+        out
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
         // The state may have absorbed secret material (keys, chaining
-        // values); drop it deliberately.
+        // values); wipe it whether or not `finalize` ran, so a hasher
+        // abandoned mid-stream on an error path leaves nothing behind.
         for word in &mut self.h {
             *word = 0;
         }
         ct::wipe(&mut self.buf);
-        out
+        core::hint::black_box(&mut *self);
     }
 }
 
@@ -208,7 +216,7 @@ impl Default for Blake2s256 {
 impl core::fmt::Debug for Blake2s256 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Never print absorbed (possibly secret) state.
-        f.write_str("Blake2s256 {{ .. }}")
+        f.write_str("Blake2s256 { .. }")
     }
 }
 
@@ -262,7 +270,7 @@ impl Blake2sMac {
 
 impl core::fmt::Debug for Blake2sMac {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Blake2sMac {{ .. }}")
+        f.write_str("Blake2sMac { .. }")
     }
 }
 

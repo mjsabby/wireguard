@@ -96,8 +96,10 @@ impl Poly1305 {
         let s3 = r3.wrapping_mul(5);
         let s4 = r4.wrapping_mul(5);
 
-        // Bounds: h < 2^27, r < 2^26, s < 2^29 ⇒ each product < 2^56 and
-        // each 5-term sum < 2^58.4, well inside u64.
+        // Bounds: h0..h4 < 2^27 (h1 may carry an extra 2^10 from the
+        // previous round's wrap-around fold, still < 2^27), r < 2^26,
+        // s < 2^29 ⇒ each product < 2^56 and each 5-term sum < 2^58.4,
+        // well inside u64.
         let m = u64::wrapping_mul;
         let d0 = m(h0, r0)
             .wrapping_add(m(h1, s4))
@@ -189,6 +191,10 @@ impl Poly1305 {
     /// (the AEAD's `pad16`). Calls must themselves start on a block
     /// boundary, which the AEAD construction guarantees.
     pub fn update_padded(&mut self, data: &[u8]) -> &mut Self {
+        debug_assert_eq!(
+            self.buf_len, 0,
+            "update_padded must be entered on a block boundary"
+        );
         self.update(data);
         let rem = data.len() % 16;
         if rem != 0 {
@@ -282,20 +288,26 @@ impl Poly1305 {
         for (chunk, word) in tag.chunks_exact_mut(4).zip([o0, o1, o2, o3].iter()) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
+        // Key-derived state is wiped by `Drop` below.
+        tag
+    }
+}
 
-        // Wipe key-derived state.
+impl Drop for Poly1305 {
+    fn drop(&mut self) {
+        // Wipe everything key-derived whether or not `finalize` ran, so
+        // a `Poly1305` abandoned mid-stream leaves nothing behind.
         self.r = [0; 5];
         self.h = [0; 5];
         self.pad = [0; 4];
         ct::wipe(&mut self.buf);
-        core::hint::black_box(&mut self);
-        tag
+        core::hint::black_box(self);
     }
 }
 
 impl core::fmt::Debug for Poly1305 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Poly1305 {{ .. }}")
+        f.write_str("Poly1305 { .. }")
     }
 }
 

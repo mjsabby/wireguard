@@ -145,6 +145,18 @@ impl Timers {
         }
     }
 
+    /// May persistent-keepalive start a fresh handshake attempt at `now`?
+    /// Always when not given-up; after `gave_up`, only once a full
+    /// keepalive interval has elapsed since the last initiation, so a
+    /// dead peer is probed once per interval rather than continuously.
+    pub fn persistent_revive_allowed(&self, now: Ticks, interval_ns: u64) -> bool {
+        if !self.gave_up {
+            return true;
+        }
+        self.last_initiation_tx
+            .is_none_or(|t| now.since(t) >= interval_ns)
+    }
+
     pub fn dead_peer_at(&self) -> Option<Ticks> {
         if self.gave_up {
             return None;
