@@ -90,6 +90,109 @@ fn initiation_retransmits_on_schedule_until_attempt_expiry() {
 }
 
 #[test]
+fn timer_retransmits_use_distinct_ephemerals() {
+    // Forward secrecy: every retransmitted initiation must carry a FRESH X25519
+    // ephemeral — reusing one staged ephemeral across retries would erode the
+    // per-handshake secrecy guarantee. (Ported from impl 2's
+    // `f7_timer_retries_use_distinct_ephemerals`.)
+    //
+    // Wire layout of a HandshakeInitiation: type(4) ‖ sender(4) ‖ ephemeral(32),
+    // so the unencrypted ephemeral is bytes [8..40].
+    let mut p = new_pair(140);
+    let now = p.clock.now();
+    let mut wire = [0u8; 2048];
+
+    let init = p.a.initiate_handshake(now, &mut wire, &mut p.rng).unwrap();
+    assert_eq!(init.len(), 148);
+    let mut ephemerals: Vec<[u8; 32]> = vec![init[8..40].try_into().unwrap()];
+
+    // Drive several timer-driven retransmits (no response ever arrives).
+    for _ in 0..3 {
+        let wake = p.a.next_wake().expect("retransmit timer armed");
+        let at = p.clock.advance(wake.nanos() - p.clock.mono_ns);
+        match p.a.poll(at, &mut wire, &mut p.rng).unwrap() {
+            PollOutput::Send(w, SendReason::HandshakeRetransmit) => {
+                assert_eq!(w.len(), 148);
+                ephemerals.push(w[8..40].try_into().unwrap());
+            }
+            other => panic!("expected a retransmit, got {other:?}"),
+        }
+    }
+
+    // All four ephemerals (initial + 3 retransmits) must be pairwise distinct.
+    for i in 0..ephemerals.len() {
+        for j in (i + 1)..ephemerals.len() {
+            assert_ne!(
+                ephemerals[i], ephemerals[j],
+                "ephemeral reused across retransmits ({i} == {j})"
+            );
+        }
+    }
+}
+
+#[test]
+fn new_initiation_does_not_extend_current_session_expiry() {
+    // A fresh initiation arriving mid-session must NOT reset the *current*
+    // session's Reject-After-Time clock: the live session has to die at its own
+    // birthdate + 180s regardless of later handshake traffic. (Ported from
+    // impl 2's `f2_new_initiation_does_not_extend_current_session_expiry`.)
+    let mut p = new_pair(141);
+    p.establish(); // current = v1 on both, born at t = 0.
+
+    // Seal two v1 transport packets (counters 0 and 1) before anything else
+    // perturbs state. A is initiator; at t = 99s v1 is still well within its
+    // rekey/reject windows, so encapsulate uses it.
+    p.clock.advance(99 * S);
+    let v1_early = p.seal_from_a(b"v1 early");
+    let v1_late = p.seal_from_a(b"v1 late!");
+
+    // At t = 100s a brand-new initiation from A arrives at B (an unsolicited
+    // rekey). B installs it as a pending `next` session and responds; v1 stays
+    // `current` with its original birthdate. The pre-fix bug would reset v1's
+    // clock to 100s here, keeping the stale session alive until 280s.
+    let now100 = p.clock.advance(S);
+    let mut wire = [0u8; 2048];
+    let init =
+        p.a.initiate_handshake(now100, &mut wire, &mut p.rng)
+            .unwrap()
+            .to_vec();
+    let mut scratch = [0u8; 2048];
+    match p
+        .b
+        .decapsulate(now100, b"a-addr", false, &init, &mut scratch, &mut p.rng)
+        .unwrap()
+    {
+        Received::Reply(_) => {}
+        other => panic!("expected a response to the rekey init, got {other:?}"),
+    }
+
+    // Control: at t = 179s (< birthdate + 180s) v1 is still alive — the early
+    // packet decrypts on it.
+    let now179 = p.clock.advance(79 * S);
+    let mut out = [0u8; 256];
+    match p
+        .b
+        .decapsulate(now179, b"a-addr", false, &v1_early, &mut out, &mut p.rng)
+        .unwrap()
+    {
+        Received::Data(d) => assert_eq!(&d[..8], b"v1 early"),
+        other => panic!("v1 should still decrypt at 179s, got {other:?}"),
+    }
+
+    // The invariant: at t = 181s v1 is past birthdate + 180s and MUST be
+    // rejected as Expired. If the 100s initiation had extended v1's clock, this
+    // would wrongly succeed.
+    let now181 = p.clock.advance(2 * S);
+    let err =
+        p.b.decapsulate(now181, b"a-addr", false, &v1_late, &mut out, &mut p.rng)
+            .unwrap_err();
+    assert!(
+        matches!(err, Error::Expired),
+        "stale current session must expire on its own birthdate+180s, got {err:?}"
+    );
+}
+
+#[test]
 fn retransmission_jitter_is_within_spec_bounds() {
     // Across many handshake attempts, the gap between sends must be in
     // [REKEY_TIMEOUT, REKEY_TIMEOUT + 333ms] and must actually vary.
