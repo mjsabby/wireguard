@@ -121,7 +121,8 @@ fn mix_hash(h: &mut [u8; 32], part: &[u8]) {
 }
 
 /// Build a handshake initiation (whitepaper §5.4.2) into `out` with zeroed
-/// mac fields. `eph_secret_raw` must be fresh entropy.
+/// mac fields. `eph_secret_raw` must be fresh entropy. `precomputed_ss` is
+/// `DH(S_priv_local, S_pub_peer)`, computed once at tunnel construction.
 ///
 /// # Errors
 /// `BufferTooSmall`; `InvalidPublicKey` if the configured peer key is
@@ -129,9 +130,9 @@ fn mix_hash(h: &mut [u8; 32], part: &[u8]) {
 #[allow(clippy::too_many_arguments)] // internal plumbing; every argument is distinct state
 pub(crate) fn create_initiation(
     constants: &HandshakeConstants,
-    local_static: &StaticSecret,
     local_public: &PublicKey,
     peer_public: &PublicKey,
+    precomputed_ss: &[u8; 32],
     local_index: u32,
     eph_secret_raw: [u8; 32],
     timestamp: Tai64N,
@@ -168,14 +169,9 @@ pub(crate) fn create_initiation(
     drop(k);
     mix_hash(&mut h, &encrypted_static);
 
-    // ss
-    let ss = Secret::new(x25519::shared_secret(
-        local_static.as_bytes(),
-        peer_public.as_bytes(),
-    )?);
-    let (ck_next, k) = kdf::kdf2(&ck, &*ss);
+    // ss (precomputed once at tunnel construction; never changes)
+    let (ck_next, k) = kdf::kdf2(&ck, precomputed_ss);
     ck.set(ck_next);
-    drop(ss);
     let k = Secret::new(k);
     let mut encrypted_timestamp = [0u8; 28];
     aead::seal(
@@ -474,6 +470,10 @@ mod tests {
         Party { secret, public }
     }
 
+    fn ss(a: &Party, b: &Party) -> [u8; 32] {
+        x25519::shared_secret(a.secret.as_bytes(), b.public.as_bytes()).unwrap()
+    }
+
     fn run_handshake(psk_i: &PresharedKey, psk_r: &PresharedKey) -> Result<(), Error> {
         let mut rng = DeterministicRng::new(0xabcdef);
         let constants = HandshakeConstants::new();
@@ -484,9 +484,9 @@ mod tests {
         let mut wire1 = vec![0u8; HANDSHAKE_INITIATION_LEN];
         let inflight = create_initiation(
             &constants,
-            &init.secret,
             &init.public,
             &resp.public,
+            &ss(&init, &resp),
             0x1111,
             rng.gen32().unwrap(),
             Tai64N::from_unix(1_700_000_000, 0),
@@ -563,9 +563,9 @@ mod tests {
         let mut wire = vec![0u8; HANDSHAKE_INITIATION_LEN];
         create_initiation(
             &constants,
-            &init.secret,
             &init.public,
             &resp.public,
+            &ss(&init, &resp),
             1,
             rng.gen32().unwrap(),
             Tai64N::from_unix(0, 0),
@@ -593,9 +593,9 @@ mod tests {
         let mut wire = vec![0u8; HANDSHAKE_INITIATION_LEN];
         create_initiation(
             &constants,
-            &init.secret,
             &init.public,
             &resp.public,
+            &ss(&init, &resp),
             1,
             rng.gen32().unwrap(),
             Tai64N::from_unix(0, 0),
@@ -655,9 +655,9 @@ mod tests {
             let mut w1 = vec![0u8; HANDSHAKE_INITIATION_LEN];
             let inflight = create_initiation(
                 &constants,
-                &init.secret,
                 &init.public,
                 &resp.public,
+                &ss(&init, &resp),
                 i,
                 rng.gen32().unwrap(),
                 Tai64N::from_unix(i.into(), 0),

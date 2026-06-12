@@ -26,6 +26,7 @@ use crate::consts::{
     REKEY_TIMEOUT, REKEY_TIMEOUT_JITTER_MAX, SESSION_DISCARD_TIME, TRANSPORT_OVERHEAD,
 };
 use crate::cookie::{self, CookieJar, LastCookie, MacKeys};
+use crate::crypto::x25519;
 use crate::crypto::{aead, ct};
 use crate::entropy::EntropySource;
 use crate::error::Error;
@@ -184,6 +185,16 @@ enum Slot {
     Next,
 }
 
+/// `DH(S_priv_local, S_pub_peer)`: never changes for the life of a
+/// `Tunnel`, computed once at construction (audit L-1/L-2). Wiped on drop.
+struct StaticStaticSecret([u8; 32]);
+
+impl Drop for StaticStaticSecret {
+    fn drop(&mut self) {
+        ct::wipe_array(&mut self.0);
+    }
+}
+
 /// A sans-I/O WireGuard tunnel to a single peer.
 ///
 /// # Buffers
@@ -250,6 +261,8 @@ pub struct Tunnel {
     persistent_keepalive: Option<NonZeroU16>,
     constants: HandshakeConstants,
     mac_keys: MacKeys,
+    /// Precomputed `DH(local_static, peer_public)` (audit L-1/L-2).
+    precomputed_ss: StaticStaticSecret,
 
     inflight: Option<InFlightInitiation>,
     /// `mac1` of the last initiation we sent (cookie-reply AAD).
@@ -259,6 +272,10 @@ pub struct Tunnel {
     cookie: Option<LastCookie>,
     cookie_jar: CookieJar,
     greatest_timestamp: Option<Tai64N>,
+    /// TAI64N of the last initiation we sent: outbound timestamps are
+    /// ratcheted strictly past this so a frozen caller wall clock cannot
+    /// stall the handshake via peer-side `ReplayedTimestamp` (audit L-4).
+    last_sent_tai64n: Option<Tai64N>,
 
     previous: Option<Session>,
     current: Option<Session>,
@@ -301,7 +318,9 @@ impl Tunnel {
     ///
     /// # Errors
     /// [`Error::InvalidPublicKey`] if the peer's public key equals our own
-    /// public key (a configuration mix-up the protocol cannot work with).
+    /// public key, or is a low-order / all-zero point (a configuration
+    /// mix-up the protocol cannot work with — rejected here rather than on
+    /// the first `encapsulate`; audit L-1).
     pub fn new(config: Config) -> Result<Self, Error> {
         let Config {
             local_static,
@@ -313,6 +332,14 @@ impl Tunnel {
         if ct::ct_eq(local_public.as_bytes(), peer_public.as_bytes()) {
             return Err(Error::InvalidPublicKey);
         }
+        // Precompute the static-static DH once (audit L-2). This also
+        // rejects low-order `peer_public` up front (audit L-1):
+        // `shared_secret` returns `InvalidPublicKey` for an all-zero
+        // result.
+        let precomputed_ss = StaticStaticSecret(x25519::shared_secret(
+            local_static.as_bytes(),
+            peer_public.as_bytes(),
+        )?);
         let mac_keys = MacKeys::new(&local_public, &peer_public);
         Ok(Self {
             local_static,
@@ -322,12 +349,14 @@ impl Tunnel {
             persistent_keepalive,
             constants: HandshakeConstants::new(),
             mac_keys,
+            precomputed_ss,
             inflight: None,
             last_init_mac1: None,
             last_resp_mac1: None,
             cookie: None,
             cookie_jar: CookieJar::new(),
             greatest_timestamp: None,
+            last_sent_tai64n: None,
             previous: None,
             current: None,
             next: None,
@@ -840,9 +869,15 @@ impl Tunnel {
     }
 
     /// Is there a confirmed session ready to encrypt outgoing data?
+    ///
+    /// `false` once the current session is past `REJECT_AFTER_TIME` or
+    /// `REJECT_AFTER_MESSAGES` (audit M-1: this used to test only
+    /// `current.is_some()`, which stayed `true` for an unusable session).
     #[must_use]
     pub fn is_established(&self) -> bool {
-        self.current.is_some()
+        self.current
+            .as_ref()
+            .is_some_and(|s| s.usable_for_send(self.last_now))
     }
 
     /// Cumulative counters.
@@ -895,6 +930,12 @@ impl Tunnel {
         self.next = None;
         self.inflight = None;
         self.cookie = None;
+        // Audit L-3: clear the last-sent-mac1 cache too so "discard wipes
+        // everything ephemeral" holds literally. (Non-secret on-wire
+        // values, but unreachable after the index slots above are gone,
+        // so there is no reason to keep them.)
+        self.last_init_mac1 = None;
+        self.last_resp_mac1 = None;
         self.recv_rekey_done = false;
         self.timers = Timers {
             last_initiation_tx: self.timers.last_initiation_tx,
@@ -978,14 +1019,23 @@ impl Tunnel {
         } else {
             0
         };
+        // Audit L-4: ratchet the outbound TAI64N strictly past the last one
+        // we sent, so a frozen/regressed caller wall clock cannot make the
+        // peer reject every retransmission as `ReplayedTimestamp`. The
+        // ratchet adds 1 to the (already-whitened) low nanosecond bits and
+        // so leaks nothing the previous timestamp did not.
+        let timestamp = match self.last_sent_tai64n {
+            Some(last) if now.tai64n() <= last => last.tick(),
+            _ => now.tai64n(),
+        };
         let inflight = noise::create_initiation(
             &self.constants,
-            &self.local_static,
             &self.local_public,
             &self.peer_public,
+            &self.precomputed_ss.0,
             local_index,
             eph,
-            now.tai64n(),
+            timestamp,
             out,
         )?;
         let msg = out
@@ -993,6 +1043,7 @@ impl Tunnel {
             .ok_or(Error::Internal)?;
         let mac1 = cookie::apply_macs(&self.mac_keys, self.cookie.as_ref(), now.ticks, msg)?;
         // Commit: nothing below can fail.
+        self.last_sent_tai64n = Some(timestamp);
         self.last_init_mac1 = Some(mac1);
         self.inflight = Some(inflight);
         self.timers.note_initiation_tx(now.ticks, jitter);
@@ -1063,6 +1114,10 @@ impl Tunnel {
             out,
         ) {
             Ok(n) => n,
+            // Audit M-3: a too-small caller buffer is a local error, not
+            // an authentication failure — don't pollute the
+            // attacker-influenceable `auth_failures` counter with it.
+            Err(Error::BufferTooSmall) => return Err(Error::BufferTooSmall),
             Err(e) => {
                 self.stats.auth_failures = self.stats.auth_failures.saturating_add(1);
                 return Err(e);
@@ -1082,6 +1137,13 @@ impl Tunnel {
             self.previous = self.current.take();
             self.current = self.next.take();
             self.recv_rekey_done = false;
+            // Audit M-2: a confirmed session in either role satisfies any
+            // in-flight handshake of our own and any pending rekey — clear
+            // them so a simultaneous-open or a rekey raced by the peer's
+            // initiation doesn't keep retransmitting redundantly for up
+            // to 90 s. Mirrors the initiator-side commit above.
+            self.inflight = None;
+            self.timers.note_handshake_complete();
             self.stats.handshakes_completed = self.stats.handshakes_completed.saturating_add(1);
             self.stats.last_handshake_at = Some(t);
         }
@@ -1147,6 +1209,163 @@ mod tests {
             Tunnel::new(Config::new(key, public)),
             Err(Error::InvalidPublicKey)
         ));
+    }
+
+    /// Audit L-1: a low-order/zero peer public key is rejected at
+    /// construction, not on the first encapsulate.
+    #[test]
+    fn low_order_peer_public_rejected_at_construction() {
+        let mut rng = DeterministicRng::new(1);
+        let key = StaticSecret::generate(&mut rng).unwrap();
+        for bad in [[0u8; 32], {
+            let mut one = [0u8; 32];
+            one[0] = 1;
+            one
+        }] {
+            assert!(matches!(
+                Tunnel::new(Config::new(key.clone(), PublicKey::from_bytes(bad))),
+                Err(Error::InvalidPublicKey)
+            ));
+        }
+    }
+
+    /// Audit M-1: `is_established()` must reflect actual usability.
+    #[test]
+    fn is_established_false_for_expired_current() {
+        let (mut a, mut b, mut rng) = pair();
+        let now = Now::new(0, 1_700_000_000, 0);
+        let (mut wa, mut wb) = ([0u8; 2048], [0u8; 2048]);
+        let init = match a.encapsulate(now, b"x", &mut wa, &mut rng).unwrap() {
+            Encapsulated::HandshakeInitiation(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        let resp = match b
+            .decapsulate(now, &[], false, &init, &mut wb, &mut rng)
+            .unwrap()
+        {
+            Received::Reply(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        a.decapsulate(now, &[], false, &resp, &mut wa, &mut rng)
+            .unwrap();
+        assert!(a.is_established());
+        // Past Reject-After-Time: current still occupies its slot but is
+        // no longer usable for sending.
+        let late = Now::new(REJECT_AFTER_TIME, 1_700_000_180, 0);
+        let _ = a.poll(late, &mut wa, &mut rng); // bump last_now
+        assert!(
+            !a.is_established(),
+            "expired current must not report established"
+        );
+    }
+
+    /// Audit L-4: a frozen wall clock must not produce identical TAI64N
+    /// timestamps on retransmitted initiations.
+    #[test]
+    fn outbound_tai64n_is_ratcheted_past_frozen_wall_clock() {
+        let (mut a, mut b, mut rng) = pair();
+        // Wall clock frozen at one value; only mono advances.
+        let frozen = |mono| Now::new(mono, 1_700_000_000, 0);
+        let (mut wa, mut wb) = ([0u8; 2048], [0u8; 2048]);
+        let init1 = a
+            .initiate_handshake(frozen(0), &mut wa, &mut rng)
+            .unwrap()
+            .to_vec();
+        // B accepts the first.
+        assert!(matches!(
+            b.decapsulate(frozen(0), &[], false, &init1, &mut wb, &mut rng)
+                .unwrap(),
+            Received::Reply(_)
+        ));
+        // 6 s later (mono), wall clock STILL 1_700_000_000: retransmit.
+        let init2 = a
+            .initiate_handshake(frozen(6_000_000_000), &mut wa, &mut rng)
+            .unwrap()
+            .to_vec();
+        // Without the ratchet, B would reject as ReplayedTimestamp.
+        assert!(matches!(
+            b.decapsulate(frozen(6_000_000_000), &[], false, &init2, &mut wb, &mut rng)
+                .unwrap(),
+            Received::Reply(_)
+        ));
+    }
+
+    /// Audit M-2: confirming a responder session clears any in-flight
+    /// handshake of our own.
+    #[test]
+    fn responder_promotion_clears_own_inflight() {
+        let (mut a, mut b, mut rng) = pair();
+        let now = Now::new(0, 1_700_000_000, 0);
+        let (mut wa, mut wb) = ([0u8; 2048], [0u8; 2048]);
+        // B starts its OWN handshake (so b.inflight is set).
+        let _b_init = b.initiate_handshake(now, &mut wb, &mut rng).unwrap();
+        // Meanwhile A initiates; B responds (next set, inflight still set).
+        let a_init = a
+            .initiate_handshake(now, &mut wa, &mut rng)
+            .unwrap()
+            .to_vec();
+        let resp = match b
+            .decapsulate(now, &[], false, &a_init, &mut wb, &mut rng)
+            .unwrap()
+        {
+            Received::Reply(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        a.decapsulate(now, &[], false, &resp, &mut wa, &mut rng)
+            .unwrap();
+        // A's first transport confirms B's `next` → promotion.
+        let data = match a.encapsulate(now, b"hi", &mut wa, &mut rng).unwrap() {
+            Encapsulated::Transport(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        b.decapsulate(now, &[], false, &data, &mut wb, &mut rng)
+            .unwrap();
+        // B's own inflight handshake must now be cleared: poll at the
+        // retransmit deadline produces no HandshakeRetransmit.
+        let later = Now::new(6_000_000_000, 1_700_000_006, 0);
+        let r = b.poll(later, &mut wb, &mut rng).unwrap();
+        assert!(
+            !matches!(r, PollOutput::Send(_, SendReason::HandshakeRetransmit)),
+            "M-2: stale inflight retransmitted after promotion: {r:?}"
+        );
+        assert!(b.inflight.is_none());
+    }
+
+    /// Audit M-3: a caller-side BufferTooSmall on transport receive must
+    /// not count as an authentication failure.
+    #[test]
+    fn buffer_too_small_does_not_count_as_auth_failure() {
+        let (mut a, mut b, mut rng) = pair();
+        let now = Now::new(0, 1_700_000_000, 0);
+        let (mut wa, mut wb) = ([0u8; 2048], [0u8; 2048]);
+        let init = match a.encapsulate(now, b"x", &mut wa, &mut rng).unwrap() {
+            Encapsulated::HandshakeInitiation(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        let resp = match b
+            .decapsulate(now, &[], false, &init, &mut wb, &mut rng)
+            .unwrap()
+        {
+            Received::Reply(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        a.decapsulate(now, &[], false, &resp, &mut wa, &mut rng)
+            .unwrap();
+        let data = match a.encapsulate(now, &[7u8; 64], &mut wa, &mut rng).unwrap() {
+            Encapsulated::Transport(w) => w.to_vec(),
+            _ => panic!(),
+        };
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            b.decapsulate(now, &[], false, &data, &mut tiny, &mut rng)
+                .err(),
+            Some(Error::BufferTooSmall)
+        );
+        assert_eq!(
+            b.stats().auth_failures,
+            0,
+            "BufferTooSmall is a caller error, not an auth failure"
+        );
     }
 
     #[test]

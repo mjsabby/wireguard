@@ -141,6 +141,26 @@ impl Tai64N {
     pub const fn as_bytes(&self) -> &[u8; 12] {
         &self.0
     }
+
+    /// The smallest TAI64N strictly greater than `self` (96-bit big-endian
+    /// increment, saturating at all-ones). Used to ratchet outbound
+    /// initiation timestamps so a frozen caller wall clock cannot make the
+    /// peer reject every retransmission as
+    /// [`crate::Error::ReplayedTimestamp`]. The increment lands in the
+    /// low (whitened-away) nanosecond bits, so it leaks nothing the
+    /// previous timestamp did not.
+    #[must_use]
+    pub fn tick(self) -> Self {
+        let mut bytes = self.0;
+        for b in bytes.iter_mut().rev() {
+            let (next, carry) = b.overflowing_add(1);
+            *b = next;
+            if !carry {
+                return Self(bytes);
+            }
+        }
+        Self([0xff; 12]) // saturate (unreachable before year ~10^11)
+    }
 }
 
 impl fmt::Debug for Tai64N {
@@ -205,5 +225,20 @@ mod tests {
         let _ = Tai64N::from_unix(u64::MAX, u32::MAX);
         let _ = Now::new(u64::MAX, u64::MAX, u32::MAX);
         assert_eq!(Now::new(0, 0, u32::MAX).unix_nanos, 999_999_999);
+    }
+
+    #[test]
+    fn tai64n_tick_is_strictly_greater_and_carries() {
+        let t = Tai64N::from_unix(100, 0);
+        assert!(t.tick() > t);
+        // Carry across the nanos→seconds boundary.
+        let edge = Tai64N::from_bytes([0, 0, 0, 0, 0, 0, 0, 7, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            edge.tick().as_bytes(),
+            &[0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0]
+        );
+        // Saturates at the top instead of wrapping to zero.
+        let max = Tai64N::from_bytes([0xff; 12]);
+        assert_eq!(max.tick(), max);
     }
 }

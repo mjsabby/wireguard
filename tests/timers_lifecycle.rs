@@ -414,7 +414,12 @@ fn session_discard_after_three_reject_after_time() {
             .unwrap(),
         PollOutput::Idle
     ));
-    assert!(p.a.is_established());
+    // Audit M-1: at 540 s − 1 ns the current session is long past
+    // Reject-After-Time and no longer usable for sending, so
+    // `is_established()` is (now correctly) false even though the slot
+    // has not yet been wiped.
+    assert!(!p.a.is_established());
+    assert!(p.a.stats().last_handshake_at.is_some());
     p.clock.advance(1);
     let (_, events) = drain(&mut p.a, p.clock.now(), &mut p.rng);
     assert_eq!(events, vec!["sessions_expired"]);
